@@ -34,7 +34,16 @@ const comboLabel = (mode, format) => (format === 'TRI' ? '3 Bahasa' : `${MODE_LA
  * text/plain agar browser tidak mengirim preflight CORS (GAS tidak mendukung OPTIONS).
  * ------------------------------------------------------------------------- */
 const API = {
-  url: String((window.APP_CONFIG && window.APP_CONFIG.GAS_URL) || '').trim(),
+  URL_KEY: 'transkrip_gas_url',
+  get url() {
+    let u = '';
+    try { u = localStorage.getItem(this.URL_KEY) || ''; } catch (e) { u = this._url || ''; }
+    return String(u || (window.APP_CONFIG && window.APP_CONFIG.GAS_URL) || '').trim();
+  },
+  setUrl(u) {
+    this._url = u;
+    try { if (u) localStorage.setItem(this.URL_KEY, u); else localStorage.removeItem(this.URL_KEY); } catch (e) { /* memori saja */ }
+  },
   KEY: 'transkrip_kode_akses',
   get token() {
     try { return localStorage.getItem(this.KEY) || sessionStorage.getItem(this.KEY) || ''; } catch (e) { return this._mem || ''; }
@@ -63,7 +72,7 @@ async function rawCall(action, args, token) {
       body: JSON.stringify({ action, args, token })
     });
   } catch (e) {
-    throw new ApiError('Tidak dapat terhubung ke server Apps Script. Periksa koneksi internet dan pastikan Web App di-deploy dengan akses "Siapa saja" (Anyone).', 'NETWORK');
+    throw new ApiError('Tidak dapat terhubung ke server Apps Script. Klik "Tes koneksi" di bawah: jika yang muncul bukan teks {"ok":true,…,"version":"2.2.0"}, berarti URL ini belum menjalankan Code.gs versi baru (Deploy → Manage deployments → Edit → Version: New version), atau aksesnya bukan "Siapa saja" (Anyone).', 'NETWORK');
   }
   const text = await res.text();
   let out;
@@ -354,8 +363,145 @@ const ExcelParser = (function () {
     return { source: 'KURIKULUM', kurikulum: { nama: y ? y[1] + '/' + y[2] : '', entries }, students: [], grades: [], warnings, summary: [] };
   }
 
+  /* ---- FORMAT D — "Ekspor Transkrip" (.xls berisi tabel HTML) ------------------
+   * Baris identitas Field | Value (Student, Class, Stream, Grade 10/11/12, Cumulative GPA …),
+   * lalu blok "Semester I — 2024/2025 — …" + header Group | Subject name | Report | Grade |
+   * Grade point | Credits | Score, ditutup TOTAL / SEMESTER GPA. NIS tidak ada di file. */
+  const SEM_TITLE = /^semester\s+(VI|IV|V|I{1,3}|[1-6])\b(.*)$/i;
+  const numOf = (v) => { const t = norm(v).replace(',', '.'); return t !== '' && !isNaN(Number(t)) ? Number(t) : null; };
+  const filledOf = (row) => (row || []).map(norm).filter(Boolean);
+  const isSubjectKey = (k) => /^(subjectname|subject|subjects|matapelajaran|mapel|namamapel)$/.test(k);
+  const isCreditKey = (k) => /^(credits?|sks)$/.test(k);
+
+  function eksporBlocks(rows) {
+    const out = [];
+    for (let r = 0; r < rows.length - 1; r++) {
+      const f = filledOf(rows[r]);
+      if (f.length !== 1 || !SEM_TITLE.test(f[0])) continue;
+      const head = (rows[r + 1] || []).map(keyOf);
+      if (head.some(isSubjectKey) && head.some(isCreditKey)) out.push(r);
+    }
+    return out;
+  }
+  const isEkspor = (rows) => eksporBlocks(rows).length > 0;
+
+  function parseEkspor(rows) {
+    const warnings = [];
+    const info = {};
+    const student = { NIS: '' };
+    const years = {};
+    // ---- identitas (sebelum blok semester pertama)
+    const blocks = eksporBlocks(rows);
+    for (let r = 0; r < blocks[0]; r++) {
+      const f = filledOf(rows[r]);
+      if (f.length === 1) {
+        const m = /^(academic\s+transcript|transkrip(\s+nilai|\s+akademik)?)\s*[—–-]\s*(.+)$/i.exec(f[0]);
+        if (m) info.judul = norm(m[3]);
+        continue;
+      }
+      if (f.length < 2) continue;
+      const k = keyOf(f[0]), v = f[1];
+      if (/^(field|kolom)$/.test(k)) continue;
+      if (/^(student|studentname|name|nama|namasiswa|namalengkap)$/.test(k)) student.Nama_Siswa = v;
+      else if (/^(nisnisn|nisn?nis)$/.test(k)) { const pr = v.split('/').map(norm); student.NIS = pr[0] || ''; student.NISN = pr[1] || ''; }
+      else if (/^(nis|studentid|studentnumber|nomorinduk|noinduk)$/.test(k)) student.NIS = v;
+      else if (/^nisn$/.test(k)) student.NISN = v;
+      else if (/^(gender|sex|jeniskelamin|jk)$/.test(k)) student.Jenis_Kelamin = v;
+      else if (/^(placeofbirth|tempatlahir)$/.test(k)) student.Tempat_Lahir = v;
+      else if (/^(dateofbirth|tanggallahir)$/.test(k)) student.Tanggal_Lahir = v;
+      else if (/^(parent|parentname|parents|namaortu|namaorangtua|namawali)/.test(k)) student.Nama_Ortu = v;
+      else if (/^(class|kelas)$/.test(k)) info.kelas = v;
+      else if (/^(stream|jurusan|peminatan|program)/.test(k)) info.stream = v;
+      else if (/^(grade|kelas)(10|11|12|x|xi|xii)$/.test(k)) {
+        const g = { x: 10, xi: 11, xii: 12 }[k.replace(/^(grade|kelas)/, '')] || Number(k.replace(/^(grade|kelas)/, ''));
+        const y = /(\d{4})\s*\/\s*(\d{4})/.exec(v); if (y) years[g] = y[1] + '/' + y[2];
+      }
+      else if (/^(cumulativegpa|gpa|ipk)$/.test(k)) info.ipk = numOf(v);
+      else if (/^(totalcredits|totalsks|jumlahsks)$/.test(k)) info.sks = numOf(v);
+      else if (/^(qualitypoints|totalscore|jumlahmutu|totalmutu)$/.test(k)) info.mutu = numOf(v);
+      else if (/^(academicstanding|predikat|standing)$/.test(k)) info.predikat = v;
+    }
+    if (!student.Nama_Siswa && info.judul) student.Nama_Siswa = info.judul;
+    if (!student.Nama_Siswa) throw new Error('Nama siswa tidak ditemukan (baris "Student").');
+    student.Nama_Siswa = norm(student.Nama_Siswa).toUpperCase();
+
+    // ---- nilai per semester
+    const grades = [];
+    const semTahun = {};
+    blocks.forEach((r0) => {
+      const title = filledOf(rows[r0])[0];
+      const m = SEM_TITLE.exec(title);
+      const sem = ROMAN[m[1].toUpperCase()] || Number(m[1]);
+      const y = /(\d{4})\s*\/\s*(\d{4})/.exec(title);
+      const tahun = y ? y[1] + '/' + y[2] : (years[sem <= 2 ? 10 : sem <= 4 ? 11 : 12] || '');
+      semTahun[sem] = tahun;
+      const head = (rows[r0 + 1] || []).map(keyOf);
+      const col = (re) => head.findIndex((k) => re.test(k));
+      const cGroup = col(/^(group|kelompok|kelompokmapel)$/), cSubj = head.findIndex(isSubjectKey);
+      const cNilai = col(/^(report|nilai|mark|marks|reportscore)/), cSks = head.findIndex(isCreditKey);
+      const cScore = col(/^(score|mutu|qualitypoints?)$/);
+      if (cNilai < 0) { warnings.push(`Semester ${sem}: kolom nilai (Report) tidak ditemukan.`); return; }
+      let urutan = 0, sksFile = null, sksSum = 0, mutuSum = 0;
+      for (let r = r0 + 2; r < rows.length; r++) {
+        const row = rows[r] || [];
+        const f = filledOf(row);
+        if (!f.length || (f.length === 1 && (SEM_TITLE.test(f[0]) || /^grade\s*scale|^skala/i.test(f[0])))) break;
+        const subj = norm(row[cSubj]);
+        if (/^(total|jumlah)\b/i.test(subj)) { sksFile = numOf(row[cSks]); continue; }
+        if (/^(semester\s*gpa|ips|indeks)/i.test(subj)) break;
+        if (!subj) continue;
+        urutan++;
+        const nilai = numOf(row[cNilai]);
+        if (nilai === null) continue; // belum ada nilai (semester berjalan / mapel tanpa nilai)
+        const sks = numOf(row[cSks]);
+        const group = cGroup >= 0 ? norm(row[cGroup]) : '';
+        const mapel = { raw: subj, id: '', en: subj, ar: '', kelompok: group };
+        // "Informatics (Coding/AI)" di luar kelompok umum = TIK (Koding/KA); di kelompok umum = Informatika
+        if (/^informati(cs|ka)\b/i.test(subj) && group && !/general|umum|wajib/i.test(group)) mapel.kode = 'TIK';
+        if (sks === null || sks <= 0) warnings.push(`Sem ${sem} · ${subj}: tanpa SKS (sesuai file, tidak dihitung ke IPS).`);
+        else { sksSum += sks; if (cScore >= 0) mutuSum += numOf(row[cScore]) || 0; }
+        grades.push({ NIS: student.NIS, Kategori: 'GPA', Semester: sem, Tahun_Pelajaran: tahun, Urutan: urutan, Nilai: nilai, SKS: sks !== null && sks > 0 ? sks : '', Mapel: mapel });
+      }
+      if (sksFile !== null && sksFile !== sksSum) warnings.push(`Semester ${sem}: total SKS di file ${sksFile}, terbaca ${sksSum}.`);
+    });
+    if (!grades.length) throw new Error('Tidak ada nilai yang terbaca dari blok semester.');
+
+    const ys = [10, 11, 12].map((g) => years[g]).filter(Boolean);
+    const tAll = Object.keys(semTahun).sort().map((k) => semTahun[k]).filter(Boolean);
+    const first = ys[0] || tAll[0], last = years[12] || (first ? (Number(first.slice(0, 4)) + 2) + '/' + (Number(first.slice(0, 4)) + 3) : '');
+    if (first && last) student.Masa_Studi = first + ' – ' + last;
+    const sksTotal = grades.reduce((a, g) => a + (Number(g.SKS) || 0), 0);
+    if (info.sks != null && info.sks !== sksTotal) warnings.push(`Total SKS di file ${info.sks}, terbaca ${sksTotal}.`);
+    return { source: 'EKSPOR', students: [student], grades, warnings, info };
+  }
+
+  /** Tabel HTML (file .xls hasil ekspor web) → array baris; colspan diratakan. */
+  function rowsFromHtml(text, DOMParserImpl) {
+    const doc = new (DOMParserImpl || DOMParser)().parseFromString(String(text || ''), 'text/html');
+    const rows = [];
+    Array.from(doc.getElementsByTagName('tr')).forEach((tr) => {
+      const row = [];
+      Array.from(tr.children).forEach((cell) => {
+        if (!/^t[dh]$/i.test(cell.tagName)) return;
+        const t = String(cell.textContent || '').replace(/[\s ]+/g, ' ').trim();
+        row.push(/^-?\d+(\.\d+)?$/.test(t) ? Number(t) : t);
+        const span = Math.min(Number(cell.getAttribute('colspan')) || 1, 50);
+        for (let i = 1; i < span; i++) row.push('');
+      });
+      rows.push(row);
+    });
+    return rows;
+  }
+
+  /** Workbook dari tabel HTML agar bisa diproses parser biasa. */
+  function workbookFromHtml(text, DOMParserImpl) {
+    const ws = XLSX.utils.aoa_to_sheet(rowsFromHtml(text, DOMParserImpl));
+    return { SheetNames: ['Sheet1'], Sheets: { Sheet1: ws } };
+  }
+
   function detect(wb) {
     if (isKurikulum(wb)) return 'KURIKULUM';
+    if (wb.SheetNames.some((n) => isEkspor(rowsOf(wb.Sheets[n])))) return 'EKSPOR';
     const names = wb.SheetNames.map((n) => n.trim().toLowerCase());
     if (names.some((n) => /^(data[_ ]?)?siswa$/.test(n)) && names.some((n) => /^(data[_ ]?)?nilai$/.test(n))) return 'MASSAL';
     if (wb.SheetNames.some((n) => findSemesterBlocks(rowsOf(wb.Sheets[n])))) return 'KALKULATOR';
@@ -374,15 +520,17 @@ const ExcelParser = (function () {
 
   function parse(wb, fileName) {
     const type = detect(wb);
-    if (!type) throw new Error('Format file tidak dikenali. Gunakan Kalkulator Transkrip (SEM 1-2 … + REKAP), Format Massal (SISWA + NILAI), atau Struktur Kurikulum (KELAS X/XI/XII).');
+    if (!type) throw new Error('Format file tidak dikenali. Gunakan Kalkulator Transkrip (SEM 1-2 … + REKAP), Format Massal (SISWA + NILAI), Ekspor Transkrip (.xls: Student · Semester I … · Subject name · Credits), atau Struktur Kurikulum (KELAS X/XI/XII).');
     if (type === 'KURIKULUM') { const k = parseKurikulum(wb, fileName); k.fileName = fileName || ''; return k; }
-    const res = type === 'MASSAL' ? parseMassal(wb) : parseKalkulator(wb);
+    const res = type === 'MASSAL' ? parseMassal(wb)
+      : type === 'EKSPOR' ? parseEkspor(rowsOf(wb.Sheets[wb.SheetNames.find((n) => isEkspor(rowsOf(wb.Sheets[n])))]))
+        : parseKalkulator(wb);
     res.fileName = fileName || '';
     res.summary = summarize(res);
     return res;
   }
 
-  return { parse, detect, splitMapel, findSemesterBlocks, findIdentity, summarize, parseKurikulum };
+  return { parse, detect, splitMapel, findSemesterBlocks, findIdentity, summarize, parseKurikulum, parseEkspor, rowsFromHtml, workbookFromHtml };
 })();
 // === PARSER END ===
 
@@ -658,6 +806,8 @@ function showLogin(msg) {
   $('loginErr').textContent = msg || '';
   $('loginErr').classList.toggle('hidden', !msg);
   $('loginServer').textContent = API.url ? API.url.replace(/^https:\/\//, '').replace(/\/macros\/s\/(.{6}).*(.{6})\/exec$/, '/macros/s/$1…$2/exec') : '(GAS_URL belum diisi di config.js)';
+  $('loginPing').href = API.url ? API.url + '?action=ping' : '#';
+  $('loginUrl').value = API.url;
   $('btnLogout').classList.add('hidden');
   openModal('loginModal');
   setTimeout(() => $('loginToken').focus(), 50);
@@ -685,6 +835,18 @@ function bindLogin() {
     } finally {
       btn.disabled = false; btn.textContent = 'Masuk';
     }
+  });
+  $('loginUrlSave').addEventListener('click', () => {
+    const u = $('loginUrl').value.trim();
+    if (u && !/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(u)) {
+      $('loginErr').textContent = 'URL harus berbentuk https://script.google.com/macros/s/…/exec (bukan /dev).';
+      $('loginErr').classList.remove('hidden'); return;
+    }
+    const def = String((window.APP_CONFIG && window.APP_CONFIG.GAS_URL) || '').trim();
+    API.setUrl(u && u !== def ? u : '');
+    $('loginErr').classList.add('hidden');
+    showLogin();
+    toast(u && u !== def ? 'URL server disimpan di browser ini.' : 'Memakai URL dari config.js.', 'ok');
   });
   $('loginShow').addEventListener('click', () => {
     const i = $('loginToken'); i.type = i.type === 'password' ? 'text' : 'password';
@@ -819,7 +981,7 @@ async function refreshAll() {
  * ------------------------------------------------------------------------- */
 const SOURCE_LABEL = {
   KALKULATOR: 'Excel · Kalkulator Transkrip', MASSAL: 'Excel · Format Massal',
-  KURIKULUM: 'Excel · Struktur Kurikulum', 'DOCX-GPA': 'DOCX · Academic Transcript (GPA)', 'DOCX-RAPOR': 'DOCX · Transkrip Nilai Rapor', 'DOCX-3BAHASA': 'DOCX · Transkrip 3 Bahasa'
+  KURIKULUM: 'Excel · Struktur Kurikulum', EKSPOR: 'Excel · Ekspor Transkrip', 'DOCX-GPA': 'DOCX · Academic Transcript (GPA)', 'DOCX-RAPOR': 'DOCX · Transkrip Nilai Rapor', 'DOCX-3BAHASA': 'DOCX · Transkrip 3 Bahasa'
 };
 
 function handleFile(file) {
@@ -839,8 +1001,12 @@ function handleFile(file) {
         res = DocxParser.parseXml(await part.async('string'));
         res.summary = ExcelParser.summarize(res);
       } else {
-        res = ExcelParser.parse(XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: true }), file.name);
+        const bytes = new Uint8Array(e.target.result);
+        const html = htmlTextOf(bytes);
+        const wb = html ? ExcelParser.workbookFromHtml(html) : XLSX.read(bytes, { type: 'array', cellDates: true });
+        res = ExcelParser.parse(wb, file.name);
       }
+      matchMissingNis(res);
       res.fileName = file.name;
       state.parsed = res;
       renderParsed();
@@ -851,6 +1017,37 @@ function handleFile(file) {
   reader.readAsArrayBuffer(file);
 }
 
+/** .xls hasil ekspor web sering berupa tabel HTML; kembalikan teksnya (atau '' bila bukan HTML). */
+function htmlTextOf(bytes) {
+  let i = 0;
+  if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) i = 3;
+  while (i < bytes.length && i < 64 && /\s/.test(String.fromCharCode(bytes[i]))) i++;
+  if (bytes[i] !== 0x3C) return ''; // bukan diawali '<'
+  const text = new TextDecoder('utf-8').decode(bytes);
+  return /<table[\s>]/i.test(text) ? text : '';
+}
+
+const normPersonName = (s) => String(s || '').toUpperCase().replace(/[^A-Z\u00C0-\u024F ]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+/** File tanpa NIS (Ekspor Transkrip): cocokkan dengan siswa yang sudah ada berdasarkan nama. */
+function matchMissingNis(res) {
+  if (!res || !Array.isArray(res.students)) return;
+  res.students.forEach((s) => {
+    if (s.NIS) return;
+    const nm = normPersonName(s.Nama_Siswa);
+    const hits = state.students.filter((x) => normPersonName(x.Nama_Siswa) === nm);
+    if (hits.length === 1) { assignNis(res, s, hits[0].NIS, hits[0].NISN); res.nisMatched = true; }
+  });
+}
+
+function assignNis(res, student, nis, nisn) {
+  student.NIS = String(nis).trim();
+  if (nisn && !student.NISN) student.NISN = String(nisn).trim();
+  res.grades.forEach((g) => { if (!g.NIS) g.NIS = student.NIS; });
+  res.warnings = (res.warnings || []).filter((w) => !/^NIS tidak ada di file/.test(w));
+  res.summary = ExcelParser.summarize(res);
+}
+
 function renderParsed() {
   const p = state.parsed;
   $('parseBadge').textContent = SOURCE_LABEL[p.source] || p.source;
@@ -859,12 +1056,27 @@ function renderParsed() {
   const st = p.students[0] || {};
   const extra = p.source.indexOf('DOCX') === 0
     ? `<div class="text-slate-500 mb-1">${['Nomor_Transkrip', 'Nomor_Rapor', 'Tempat_Lahir', 'Tanggal_Lahir', 'Nama_Ortu'].filter((k) => st[k]).map((k) => `${k.replace(/_/g, ' ')}: <b>${esc(st[k])}</b>`).join(' · ')}</div>` : '';
-  $('parseSummary').innerHTML =
+  const inf = p.info || {};
+  const infoLine = p.source === 'EKSPOR'
+    ? `<div class="text-slate-500 mb-1">${[inf.kelas && 'Kelas <b>' + esc(inf.kelas) + '</b>', inf.stream && esc(inf.stream), inf.ipk != null && 'IPK di file <b>' + esc(inf.ipk) + '</b>', inf.sks != null && inf.sks + ' SKS'].filter(Boolean).join(' · ')}
+       <div class="text-[11px] mt-0.5">Urutan &amp; kelompok mapel mengikuti file. Kolom Grade/Grade point/Score dihitung ulang dari nilai dengan skala di sheet Skala.</div></div>` : '';
+  const needNis = p.students.length === 1 && !p.students[0].NIS;
+  const nisBox = needNis ? `
+    <div class="my-2 p-2.5 rounded-lg bg-amber-50 border border-amber-200">
+      <div class="font-semibold text-amber-900 mb-1">NIS tidak ada di file — isi sebelum menyimpan</div>
+      <div class="grid grid-cols-2 gap-2">
+        <div><label class="label" for="importNis">NIS *</label><input id="importNis" class="input input-sm font-mono" list="importNisList" placeholder="mis. 232410017" autocomplete="off"></div>
+        <div><label class="label" for="importNisn">NISN</label><input id="importNisn" class="input input-sm font-mono" placeholder="opsional" autocomplete="off"></div>
+      </div>
+      <datalist id="importNisList">${state.students.map((x) => `<option value="${esc(x.NIS)}">${esc(x.Nama_Siswa)}</option>`).join('')}</datalist>
+      <div class="text-[11px] text-amber-800 mt-1">Pilih dari daftar bila siswa sudah ada (data nilai semester yang sama akan diganti), atau ketik NIS baru.</div>
+    </div>` : (p.nisMatched ? `<div class="text-[11px] text-emerald-700 mb-1">✓ NIS dicocokkan otomatis dengan siswa yang sudah ada (berdasarkan nama).</div>` : '');
+  $('parseSummary').innerHTML = infoLine + nisBox +
     `<div class="text-slate-500 mb-1">${p.summary.length} siswa · ${p.grades.length} nilai terbaca${p.grades.some((g) => g.Kategori === 'RAPOR') ? ' · <b class="text-blue-700">disimpan sebagai nilai rapor</b>' : ''}</div>` + extra +
     p.summary.map((s) => `
       <div class="flex items-center gap-2 py-1 border-b border-slate-100 last:border-0">
         <div class="min-w-0 flex-1"><div class="font-semibold text-slate-800 truncate">${esc(s.Nama_Siswa)}</div>
-        <div class="text-slate-500">NIS ${esc(s.NIS)} · ${s.count} nilai${s.rapor ? '' : ' · ' + s.sks + ' SKS'}</div></div>
+        <div class="text-slate-500">${s.NIS ? 'NIS ' + esc(s.NIS) : '<span class="text-amber-700">NIS belum diisi</span>'} · ${s.count} nilai${s.rapor ? '' : ' · ' + s.sks + ' SKS'}</div></div>
         <div class="flex gap-0.5">${[1, 2, 3, 4, 5, 6].map((n) => `<span class="sem-dot ${s.semesters.includes(n) ? (s.rapor ? 'sem-rap' : 'sem-on') : 'sem-off'}">${n}</span>`).join('')}</div>
       </div>`).join('');
   const w = p.warnings || [];
@@ -903,6 +1115,15 @@ async function saveImport() {
   const p = state.parsed;
   if (!p) return;
   if (p.source === 'KURIKULUM') return saveKurikulum(p);
+  const missing = p.students.filter((s) => !s.NIS);
+  if (missing.length) {
+    const nis = $('importNis') ? $('importNis').value.trim() : '';
+    if (!/^[0-9A-Za-z.\-\/]{3,30}$/.test(nis)) { toast('Isi NIS siswa terlebih dahulu (3–30 karakter, tanpa spasi).', 'err'); if ($('importNis')) $('importNis').focus(); return; }
+    const exist = state.students.find((x) => String(x.NIS) === nis);
+    if (exist && normPersonName(exist.Nama_Siswa) !== normPersonName(missing[0].Nama_Siswa) &&
+      !(await confirmBox('NIS sudah dipakai', `NIS ${nis} terdaftar atas nama ${exist.Nama_Siswa}.\nData siswa itu akan diperbarui dengan nama ${missing[0].Nama_Siswa} dan nilainya. Lanjutkan?`))) return;
+    assignNis(p, missing[0], nis, $('importNisn') ? $('importNisn').value.trim() : '');
+  }
   const payload = { source: p.source, fileName: p.fileName, students: p.students, grades: p.grades };
   try {
     const res = await withLoading('Menyimpan ke Google Sheets…', () => call('apiImport', payload), `${p.students.length} siswa · ${p.grades.length} nilai`);
