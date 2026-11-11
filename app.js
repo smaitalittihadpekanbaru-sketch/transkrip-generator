@@ -788,6 +788,12 @@ document.addEventListener('DOMContentLoaded', () => {
   bindEvents();
   bindLogin();
   renderStudentForm();
+  // Dibuka dari menu Google Sheets "Buka website & langsung masuk": #kode=…
+  const fromHash = /(?:^#|&)kode=([^&]+)/.exec(location.hash || '');
+  if (fromHash) {
+    API.setToken(decodeURIComponent(fromHash[1]), true);
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { location.hash = ''; }
+  }
   if (API.token) loadApp(); else showLogin();
 });
 
@@ -1351,6 +1357,7 @@ function renderPreview(d) {
       ${d.title.map((x, i) => `<div class="${i === 0 ? 'text-xl font-extrabold text-brand-700 tracking-wide underline' : 'font-bold text-slate-700'} ${isAr(x) ? 'ar text-2xl' : ''}">${esc(x)}</div>`).join('')}
       <div class="text-xs text-slate-500 mt-1">${esc(d.nomorLabel)} ${esc(d.nomor || '—')}</div>
       <div class="text-[11px] mt-1 ${d.jurusan ? 'text-indigo-700 font-semibold' : 'text-slate-400'}">${d.jurusan ? 'Struktur mapel: ' + esc(d.jurusan) : 'Tanpa struktur kurikulum (semua mapel yang ada nilainya)'}</div>
+      ${d.susunan ? `<div class="text-[11px] text-emerald-700 font-semibold">Urutan mapel mengikuti rapor (sheet Susunan_Mapel) — ${esc(d.susunan)}</div>` : '<div class="text-[11px] text-slate-400">Urutan mapel mengikuti file / kurikulum (SUSUNAN_MAPEL = FILE)</div>'}
     </div>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm mb-5 border border-brand-200 rounded-lg p-3 bg-brand-50/50">
       ${d.identity.map(([l, v]) => `<div class="flex gap-2"><div class="w-44 shrink-0 text-xs text-slate-500">${stack(l)}</div><div class="font-semibold">${esc(v || '—')}</div></div>`).join('')}
