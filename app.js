@@ -690,6 +690,68 @@ const DocxParser = (function () {
     return { items };
   }
 
+  /** Rapor semester (Laporan Hasil Belajar): No | Mata Pelajaran | Nilai Akhir / Rerata Nilai | Capaian Kompetensi. */
+  const GROUP_RE = /^(kelompok\b|muatan\s+lokal|mata\s+pelajaran\s+(umum|wajib|pilihan|muatan)|mapel\s+(umum|wajib|pilihan)|umum$|pilihan$|wajib$)/i;
+  function parseLhbTable(rows) {
+    const isHead = (row) => row.some((c) => /^no\.?$/i.test(c.ntext)) && row.some((c) => /^mata\s*pelajaran$/i.test(c.ntext)) &&
+      row.some((c) => /nilai|rerata/i.test(c.ntext)) && row.some((c) => /capaian|deskripsi/i.test(c.ntext)) &&
+      !row.some((c) => /^(kelas|grade)\s+x|sks|credits?|bobot|mutu|predikat/i.test(c.ntext));
+    const h = rows.findIndex(isHead);
+    if (h < 0) return null;
+    const head = rows[h];
+    const noCol = head.find((c) => /^no\.?$/i.test(c.ntext)).col;
+    const mpCol = head.find((c) => /^mata\s*pelajaran$/i.test(c.ntext)).col;
+    const nv = head.find((c) => /nilai|rerata/i.test(c.ntext) && !/capaian|deskripsi/i.test(c.ntext));
+    const items = [];
+    let group = '';
+    for (let r = h + 1; r < rows.length; r++) {
+      const row = rows[r];
+      if (isHead(row)) continue;
+      const texts = [...new Set(row.map((c) => c.ntext).filter(Boolean))];
+      const no = textAt(row, noCol), name = textAt(row, mpCol);
+      const nilai = nv ? num(textAt(row, nv.col)) : null;
+      if (nilai === null && texts.length === 1 && GROUP_RE.test(texts[0])) { group = texts[0]; continue; }
+      if (!name || !/^\d{1,2}\.?$/.test(no) || GROUP_RE.test(name)) continue;
+      items.push({ no: parseInt(no, 10), nama: name, nilai, kelompok: group });
+    }
+    return items.length ? { items } : null;
+  }
+
+  function lhbResult(parts, lines) {
+    const items = [];
+    const seen = {};
+    parts.forEach((p) => p.items.forEach((it) => {
+      const k = it.no + '|' + it.nama.toLowerCase();
+      if (!seen[k]) { seen[k] = 1; items.push(it); }
+    }));
+    let kelas = '', fase = '', semTxt = '', tahun = '', nama = '', nis = '', nisn = '';
+    lines.forEach((raw) => {
+      const t = norm(String(raw).replace(/\t/g, '  '));
+      let m;
+      if (!kelas && (m = /\bKelas\s*:?\s*(XII|XI|X)(?![A-Za-z])/i.exec(t))) kelas = m[1].toUpperCase();
+      if (!fase && (m = /\bFase\s*:?\s*([EF])\b/i.exec(t))) fase = m[1].toUpperCase();
+      if (!semTxt && (m = /\bSemester\s*:?\s*(\d|ganjil|genap)/i.exec(t))) semTxt = /ganjil/i.test(t) && !/^\d/.test(m[1]) ? 'ganjil' : m[1].toLowerCase();
+      if (!tahun && (m = /Tahun\s*Pelajaran\s*:?\s*(\d{4})\s*[-\/]\s*(\d{4})/i.exec(t))) tahun = m[1] + '/' + m[2];
+      if (!nama && (m = /\bNama(?:\s+(?:Siswa|Peserta\s*didik))?\s*:\s*(.+?)(?:\s+Kelas\b|\s+NIS\b|$)/i.exec(t))) nama = norm(m[1]);
+      if (!nis && (m = /\bNIS\s*\/\s*NISN\s*:?\s*([0-9.]+)\s*\/\s*([0-9]+)/i.exec(t))) { nis = m[1]; nisn = m[2]; }
+      if (!nisn && (m = /\bNISN\s*:?\s*([0-9]{6,})/i.exec(t))) nisn = m[1];
+      if (!nis && (m = /\bNIS\s*:?\s*([0-9.]{5,})(?!\s*\/)/i.exec(t))) nis = m[1];
+    });
+    if (!kelas && fase === 'E') kelas = 'X';
+    if (!kelas) throw new Error('Rapor terbaca, tetapi kelasnya tidak ditemukan (baris "Kelas : X / XI / XII").');
+    const base = { X: 0, XI: 2, XII: 4 }[kelas];
+    const d = parseInt(semTxt, 10);
+    const semester = d >= 3 ? d : base + (d === 2 || semTxt === 'genap' ? 2 : 1);
+    const warnings = [];
+    if (!semTxt) warnings.push('Semester tidak terbaca — dianggap semester ganjil.');
+    const student = { NIS: nis, NISN: nisn, Nama_Siswa: nama.toUpperCase() };
+    const grades = items.filter((it) => it.nilai !== null && it.nilai > 0).map((it) => ({
+      NIS: nis, Kategori: 'RAPOR', Semester: semester, Tahun_Pelajaran: tahun, Urutan: it.no, Nilai: it.nilai, SKS: '',
+      Mapel: { raw: it.nama, id: it.nama, en: '', ar: '', kelompok: it.kelompok }
+    }));
+    return { source: 'DOCX-SUSUNAN', susunan: { kelas, fase, semester, tahun, items }, students: nama ? [student] : [], grades: nama ? grades : [], warnings };
+  }
+
   function identityFrom(lines) {
     const id = {};
     const set = (k, v) => { if (v && !id[k]) id[k] = v; };
@@ -735,6 +797,12 @@ const DocxParser = (function () {
         if (label && row[i + 1].ntext && !/^\d/.test(norm(label))) lines.push(norm(label) + ' : ' + row[i + 1].ntext);
       }
     }));
+    // Rapor semester (e-Rapor) → susunan mapel
+    const lhb = tables.map(parseLhbTable).filter(Boolean);
+    if (lhb.length) {
+      const all = paras.map(pText).concat(...tables.map((rows) => rows.map((row) => row.map((c) => c.ntext).join('  '))));
+      return lhbResult(lhb, all);
+    }
     const ident = identityFrom(lines);
 
     let kind = null;
@@ -777,7 +845,7 @@ const DocxParser = (function () {
     return { source: isRapor ? 'DOCX-RAPOR' : (tri ? 'DOCX-3BAHASA' : 'DOCX-GPA'), students: [student], grades, warnings };
   }
 
-  return { parseXml, parseDateText, splitMapel };
+  return { parseXml, parseDateText, splitMapel, parseLhbTable };
 })();
 // === DOCX PARSER END ===
 
@@ -940,6 +1008,9 @@ function bindEvents() {
   $('btnRefresh').addEventListener('click', refreshAll);
   $('btnAddStudent').addEventListener('click', () => openStudentForm());
   $('btnSubjects').addEventListener('click', () => { renderSubjects(); openModal('modalSubjects'); });
+  $('btnTemplates').addEventListener('click', () => { openModal('modalTemplates'); loadTemplates(); });
+  $('templateRows').addEventListener('click', onTemplateAction);
+  $('templateRows').addEventListener('change', onTemplateFile);
 
   $('btnGenerate').addEventListener('click', () => generateMany([...state.selected], getMode(), getFormat(), getJurusan()));
   $('genResults').addEventListener('click', onDownloadClick);
@@ -987,8 +1058,45 @@ async function refreshAll() {
  * ------------------------------------------------------------------------- */
 const SOURCE_LABEL = {
   KALKULATOR: 'Excel · Kalkulator Transkrip', MASSAL: 'Excel · Format Massal',
-  KURIKULUM: 'Excel · Struktur Kurikulum', EKSPOR: 'Excel · Ekspor Transkrip', 'DOCX-GPA': 'DOCX · Academic Transcript (GPA)', 'DOCX-RAPOR': 'DOCX · Transkrip Nilai Rapor', 'DOCX-3BAHASA': 'DOCX · Transkrip 3 Bahasa'
+  KURIKULUM: 'Excel · Struktur Kurikulum', EKSPOR: 'Excel · Ekspor Transkrip', 'DOCX-GPA': 'DOCX · Academic Transcript (GPA)', 'DOCX-RAPOR': 'DOCX · Transkrip Nilai Rapor', 'DOCX-3BAHASA': 'DOCX · Transkrip 3 Bahasa',
+  'DOCX-SUSUNAN': 'DOCX · Rapor (susunan mapel)', TEMPLATE: 'DOCX · Template dokumen'
 };
+
+/* ---- Template DOCX (berisi token <<…>> / [[…]]) ---------------------------- */
+const TEMPLATE_SLOTS = [
+  ['TEMPLATE_RAPOR_LTR', 'Rapor (Indonesia/English)'], ['TEMPLATE_RAPOR_RTL', 'Rapor (Arab, RTL)'],
+  ['TEMPLATE_GPA_LTR', 'GPA (Indonesia/English)'], ['TEMPLATE_GPA_RTL', 'GPA (Arab, RTL)'],
+  ['TEMPLATE_ID_LTR', '3 Bahasa'], ['TEMPLATE_ID_RTL', '3 Bahasa (Arab, RTL)']
+];
+const slotLabel = (k) => (TEMPLATE_SLOTS.find((x) => x[0] === k) || [k, k])[1];
+
+/** Teks polos dari XML Word (token bisa terpecah ke beberapa run). */
+function docxPlainText(xml) {
+  return String(xml).replace(/<w:tab\/>/g, '\t').replace(/<\/w:p>/g, '\n').replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
+function templateInfoFromDocx(fileName, xml) {
+  const plain = docxPlainText(xml);
+  const tokens = plain.match(/<<[A-Za-z0-9_]+>>|\[\[[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?\.[A-Za-z0-9_]+\]\]/g) || [];
+  if (tokens.length < 3) return null;
+  const format = /\[\[RAPOR[.@]/.test(plain) ? 'RAPOR' : /\[\[S[1-6]\./.test(plain) ? 'GPA' : /\[\[P[1-3]\./.test(plain) ? 'TRI' : '';
+  // RTL: tabel bidiVisual, atau hampir semua paragraf ber-bidi (paragraf Arab di template 3 Bahasa LTR tidak cukup)
+  const nP = (xml.match(/<w:p[ >]/g) || []).length, nBidi = (xml.match(/<w:bidi\/>|<w:bidi w:val="(1|true|on)"\/>/g) || []).length;
+  const rtl = /<w:bidiVisual\/>/.test(xml) || (nP > 0 && nBidi / nP > 0.6) || /_RTL\b|arab/i.test(fileName);
+  let key = (/Template_(Transkrip|ID)_(LTR|RTL)/i.exec(fileName) && 'TEMPLATE_ID_' + /_(LTR|RTL)/i.exec(fileName)[1].toUpperCase()) ||
+    (/Template_GPA_(LTR|RTL)/i.exec(fileName) && 'TEMPLATE_GPA_' + /_(LTR|RTL)/i.exec(fileName)[1].toUpperCase()) ||
+    (/Template_Rapor_(LTR|RTL)/i.exec(fileName) && 'TEMPLATE_RAPOR_' + /_(LTR|RTL)/i.exec(fileName)[1].toUpperCase()) || '';
+  if (!key && format) key = (format === 'TRI' ? 'TEMPLATE_ID_' : 'TEMPLATE_' + format + '_') + (rtl ? 'RTL' : 'LTR');
+  return { format, rtl, key, tokens: [...new Set(tokens)] };
+}
+
+function bufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
 
 function handleFile(file) {
   const isDocx = /\.docx$/i.test(file.name);
@@ -1004,8 +1112,15 @@ function handleFile(file) {
         const zip = await JSZip.loadAsync(e.target.result);
         const part = zip.file('word/document.xml');
         if (!part) throw new Error('File .docx tidak valid (word/document.xml tidak ada).');
-        res = DocxParser.parseXml(await part.async('string'));
-        res.summary = ExcelParser.summarize(res);
+        const xml = await part.async('string');
+        const tpl = templateInfoFromDocx(file.name, xml);
+        if (tpl) {
+          res = { source: 'TEMPLATE', template: tpl, base64: bufferToBase64(e.target.result), students: [], grades: [], warnings: [], summary: [] };
+          if (!tpl.format) res.warnings.push('Tabel nilai ([[RAPOR.…]], [[S1.…]] atau [[P1.…]]) tidak ditemukan — template akan ditolak saat dipasang.');
+        } else {
+          res = DocxParser.parseXml(xml);
+          res.summary = ExcelParser.summarize(res);
+        }
       } else {
         const bytes = new Uint8Array(e.target.result);
         const html = htmlTextOf(bytes);
@@ -1041,7 +1156,8 @@ function matchMissingNis(res) {
   res.students.forEach((s) => {
     if (s.NIS) return;
     const nm = normPersonName(s.Nama_Siswa);
-    const hits = state.students.filter((x) => normPersonName(x.Nama_Siswa) === nm);
+    let hits = s.NISN ? state.students.filter((x) => String(x.NISN || '').trim() === String(s.NISN).trim()) : [];
+    if (hits.length !== 1) hits = state.students.filter((x) => normPersonName(x.Nama_Siswa) === nm);
     if (hits.length === 1) { assignNis(res, s, hits[0].NIS, hits[0].NISN); res.nisMatched = true; }
   });
 }
@@ -1058,7 +1174,10 @@ function renderParsed() {
   const p = state.parsed;
   $('parseBadge').textContent = SOURCE_LABEL[p.source] || p.source;
   $('parseFile').textContent = p.fileName;
+  $('btnSaveImport').textContent = p.source === 'TEMPLATE' ? 'Pasang template' : p.source === 'DOCX-SUSUNAN' ? 'Perbarui susunan mapel' : 'Simpan ke Google Sheets';
   if (p.source === 'KURIKULUM') return renderParsedKurikulum(p);
+  if (p.source === 'TEMPLATE') return renderParsedTemplate(p);
+  if (p.source === 'DOCX-SUSUNAN') return renderParsedSusunan(p);
   const st = p.students[0] || {};
   const extra = p.source.indexOf('DOCX') === 0
     ? `<div class="text-slate-500 mb-1">${['Nomor_Transkrip', 'Nomor_Rapor', 'Tempat_Lahir', 'Tanggal_Lahir', 'Nama_Ortu'].filter((k) => st[k]).map((k) => `${k.replace(/_/g, ' ')}: <b>${esc(st[k])}</b>`).join(' · ')}</div>` : '';
@@ -1115,12 +1234,153 @@ function renderParsedKurikulum(p) {
   $('parseResult').classList.remove('hidden');
 }
 
-function clearParsed() { state.parsed = null; $('parseResult').classList.add('hidden'); }
+function renderParsedTemplate(p) {
+  const t = p.template;
+  const fmt = { RAPOR: 'Rapor', GPA: 'GPA', TRI: '3 Bahasa' }[t.format] || 'tidak dikenali';
+  $('parseSummary').innerHTML = `
+    <div class="text-slate-600 mb-2">Terdeteksi <b>template ${esc(fmt)}${t.rtl ? ' (Arab, RTL)' : ''}</b> · ${t.tokens.length} token.</div>
+    <label class="label" for="tplKey">Ganti template</label>
+    <select id="tplKey" class="input input-sm mb-2">${TEMPLATE_SLOTS.map(([k, l]) => `<option value="${k}" ${k === t.key ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+    <div class="text-[11px] text-slate-500">Sebelum dipasang, template diuji: token tabel wajib harus ada dan diisi dengan data siswa sungguhan.
+      Bila gagal, template lama tetap dipakai. Template lama diarsipkan dan bisa dikembalikan lewat tombol <b>Template</b>.</div>
+    <details class="mt-1 text-[11px] text-slate-500"><summary class="cursor-pointer">Token di file ini</summary><div class="font-mono break-all mt-1">${t.tokens.map(esc).join(' ')}</div></details>`;
+  const w = p.warnings || [];
+  $('parseWarnings').classList.toggle('hidden', !w.length);
+  $('parseWarnings').innerHTML = w.map(esc).join('<br>');
+  $('parseResult').classList.remove('hidden');
+}
+
+async function saveTemplateUpload(p) {
+  const key = p.forceKey || $('tplKey').value;
+  try {
+    const res = await withLoading('Memasang template…', () => call('apiUploadTemplate', { key, fileName: p.fileName, base64: p.base64 }),
+      'Konversi ke Google Docs dan uji isi dengan data siswa');
+    if (!p.forceKey) clearParsed();
+    if (res.status) renderStatus(res.status);
+    toast(`Template ${slotLabel(key)} diganti dan langsung dipakai.` + (res.test && !res.test.skipped ? `\nUji isi berhasil dengan data ${res.test.nama}.` : ''), 'ok', 9000);
+    (res.warnings || []).forEach((w) => toast(w, 'warn', 12000));
+    if (!$('modalTemplates').classList.contains('hidden')) loadTemplates();
+  } catch (e) { toast(errMsg(e), 'err', 12000); }
+}
+
+function renderParsedSusunan(p) {
+  const s = p.susunan;
+  const st = p.students[0];
+  let last = null;
+  const list = s.items.map((it) => {
+    const head = it.kelompok && it.kelompok !== last ? `<div class="mt-1 font-bold text-slate-700">${esc(it.kelompok)}</div>` : '';
+    last = it.kelompok || last;
+    return head + `<div class="flex gap-2"><span class="w-6 text-right text-slate-400">${it.no}</span><span class="flex-1">${esc(it.nama)}</span><span class="text-slate-500">${it.nilai === null ? '' : esc(it.nilai)}</span></div>`;
+  }).join('');
+  $('parseSummary').innerHTML = `
+    <div class="text-slate-600 mb-1">Rapor <b>Kelas ${esc(s.kelas)}</b> · semester ${s.semester}${s.tahun ? ' · ' + esc(s.tahun) : ''}${st ? ' · ' + esc(st.Nama_Siswa) : ''} · <b>${s.items.length} mapel</b></div>
+    <div class="text-[11px] text-slate-500 mb-1">Urutan, kelompok, dan nama mapel di rapor ini menjadi susunan transkrip untuk Kelas ${esc(s.kelas)} (sheet Susunan_Mapel).</div>
+    ${s.kelas === 'XI' ? '<label class="flex items-center gap-2 my-1"><input id="susXII" type="checkbox" checked> Terapkan juga ke Kelas XII</label>' : ''}
+    ${st && p.grades.length ? `<label class="flex items-center gap-2 my-1"><input id="susNilai" type="checkbox"> Simpan juga ${p.grades.length} nilai rapor siswa ini (semester ${s.semester})</label>
+      ${!st.NIS ? `<div id="susNisBox" class="hidden"><label class="label" for="importNis">NIS siswa *</label><input id="importNis" class="input input-sm font-mono" list="importNisList" placeholder="NIS" autocomplete="off">
+        <datalist id="importNisList">${state.students.map((x) => `<option value="${esc(x.NIS)}">${esc(x.Nama_Siswa)}</option>`).join('')}</datalist></div>` : ''}` : ''}
+    <div id="susCheck" class="my-1 text-[11px] text-slate-500">Memeriksa kecocokan mapel…</div>
+    <div class="border-t border-slate-100 pt-1">${list}</div>`;
+  if ($('susNilai') && $('susNisBox')) $('susNilai').addEventListener('change', (e) => $('susNisBox').classList.toggle('hidden', !e.target.checked));
+  const w = p.warnings || [];
+  $('parseWarnings').classList.toggle('hidden', !w.length);
+  $('parseWarnings').innerHTML = w.map(esc).join('<br>');
+  $('parseResult').classList.remove('hidden');
+  call('apiSaveSusunan', susunanPayload(p, true)).then((r) => {
+    if (state.parsed !== p) return;
+    const rep = r.report[s.kelas] || {};
+    $('susCheck').innerHTML = `✓ ${rep.umum} mapel umum/muatan lokal${rep.pilihan ? ` · ${rep.pilihan} mapel pilihan → pola <b>${esc(rep.pola)}</b>${rep.polaBaru ? ' (baru)' : ' (diperbarui)'}` : ''}` +
+      (rep.extras && rep.extras.length ? ` · tetap disimpan (tidak ada di rapor ini): ${rep.extras.map(esc).join(', ')}` : '') +
+      (r.newSubjects.length ? `<div class="text-amber-700">Mapel baru akan dibuat: ${r.newSubjects.map(esc).join(', ')}</div>` : '');
+  }).catch((e) => { if ($('susCheck')) $('susCheck').innerHTML = `<span class="text-red-600">${esc(errMsg(e))}</span>`; });
+}
+
+function susunanPayload(p, dryRun) {
+  const s = p.susunan;
+  return { kelas: s.kelas, semester: s.semester, fileName: p.fileName, alsoXII: !!($('susXII') && $('susXII').checked),
+    items: s.items.map((it) => ({ no: it.no, nama: it.nama, kelompok: it.kelompok })), dryRun };
+}
+
+async function saveSusunan(p) {
+  const withNilai = !!($('susNilai') && $('susNilai').checked);
+  const st = p.students[0];
+  if (withNilai && st && !st.NIS) {
+    const nis = $('importNis') ? $('importNis').value.trim() : '';
+    if (!/^[0-9A-Za-z.\-\/]{3,30}$/.test(nis)) { toast('Isi NIS siswa untuk menyimpan nilai rapor.', 'err'); return; }
+    assignNis(p, st, nis, st.NISN);
+  }
+  try {
+    const res = await withLoading('Memperbarui susunan mapel…', () => call('apiSaveSusunan', susunanPayload(p, false)));
+    let msg = `Susunan mapel Kelas ${res.targets.join(' & ')} diperbarui dari rapor.`;
+    const rep = res.report[res.kelas] || {};
+    if (rep.pilihan) msg += `\nPola pilihan: ${rep.pola}${rep.polaBaru ? ' (baru)' : ''}.`;
+    if (withNilai) {
+      const imp = await withLoading('Menyimpan nilai rapor…', () => call('apiImport', { source: p.source, fileName: p.fileName, students: p.students, grades: p.grades }));
+      setStudents(imp.students);
+      msg += `\nNilai rapor tersimpan: ${imp.gradesSaved} nilai.`;
+    }
+    clearParsed();
+    toast(msg, 'ok', 9000);
+    if (res.newSubjects.length) toast(`Mapel baru: ${res.newSubjects.join(', ')} — lengkapi nama EN/AR di menu Mata Pelajaran.`, 'warn', 10000);
+  } catch (e) { toast(errMsg(e), 'err', 10000); }
+}
+
+/* ---- Modal Template ------------------------------------------------------ */
+async function loadTemplates() {
+  $('templateRows').innerHTML = `<tr><td colspan="4" class="text-center py-6 text-slate-500">Memuat…</td></tr>`;
+  try {
+    const list = await call('apiListTemplates');
+    $('templateRows').innerHTML = list.map((t) => `
+      <tr>
+        <td><div class="font-semibold text-slate-800">${esc(t.label)}</div><div class="text-[11px] text-slate-400 font-mono">${esc(t.fileName)}</div></td>
+        <td>${t.ok ? `<span class="chip chip-ok">✓ terpasang</span><div class="text-[11px] text-slate-500 mt-0.5">diubah ${esc(t.updated)}</div>`
+          : `<span class="chip ${t.rtl ? 'chip-warn' : 'chip-err'}">${t.rtl ? '•' : '✗'} ${esc(t.message || 'belum')}</span>`}</td>
+        <td class="whitespace-nowrap">
+          ${t.ok ? `<a class="btn btn-ghost btn-sm" href="${esc(t.url)}" target="_blank" rel="noopener">Buka ↗</a>
+          <button class="btn btn-ghost btn-sm" data-tpl-dl="${esc(t.key)}" type="button">⬇ DOCX</button>` : ''}
+          <label class="btn btn-primary btn-sm cursor-pointer">⬆ Ganti DOCX<input type="file" accept=".docx" class="hidden" data-tpl-up="${esc(t.key)}"></label>
+          ${t.hasPrev ? `<button class="btn btn-ghost btn-sm" data-tpl-restore="${esc(t.key)}" type="button" title="Kembalikan template sebelumnya">↶ Kembalikan</button>` : ''}
+        </td>
+      </tr>`).join('');
+  } catch (e) { $('templateRows').innerHTML = `<tr><td colspan="4" class="text-center py-6 text-red-600">${esc(errMsg(e))}</td></tr>`; }
+}
+
+async function onTemplateAction(ev) {
+  const dl = ev.target.closest('[data-tpl-dl]'), rs = ev.target.closest('[data-tpl-restore]');
+  if (dl) {
+    try { const f = await withLoading('Menyiapkan DOCX…', () => call('apiDownloadTemplate', dl.dataset.tplDl)); saveBase64(f.base64, f.mimeType, f.name); }
+    catch (e) { toast(errMsg(e), 'err'); }
+  } else if (rs) {
+    const key = rs.dataset.tplRestore;
+    if (!(await confirmBox('Kembalikan template', `Kembalikan template ${slotLabel(key)} ke versi sebelumnya?`))) return;
+    try {
+      const r = await withLoading('Mengembalikan template…', () => call('apiRestoreTemplate', key));
+      if (r.status) renderStatus(r.status);
+      toast(`Template ${slotLabel(key)} dikembalikan ke versi sebelumnya.`, 'ok');
+      loadTemplates();
+    } catch (e) { toast(errMsg(e), 'err'); }
+  }
+}
+
+function onTemplateFile(ev) {
+  const input = ev.target.closest('[data-tpl-up]');
+  if (!input || !input.files[0]) return;
+  const file = input.files[0], key = input.dataset.tplUp;
+  input.value = '';
+  if (!/\.docx$/i.test(file.name)) { toast('Pilih file Word (.docx).', 'err'); return; }
+  const reader = new FileReader();
+  reader.onload = () => saveTemplateUpload({ fileName: file.name, base64: bufferToBase64(reader.result), forceKey: key });
+  reader.readAsArrayBuffer(file);
+}
+
+function clearParsed() { state.parsed = null; $('parseResult').classList.add('hidden'); $('btnSaveImport').textContent = 'Simpan ke Google Sheets'; }
 
 async function saveImport() {
   const p = state.parsed;
   if (!p) return;
   if (p.source === 'KURIKULUM') return saveKurikulum(p);
+  if (p.source === 'TEMPLATE') return saveTemplateUpload(p);
+  if (p.source === 'DOCX-SUSUNAN') return saveSusunan(p);
   const missing = p.students.filter((s) => !s.NIS);
   if (missing.length) {
     const nis = $('importNis') ? $('importNis').value.trim() : '';
@@ -1368,12 +1628,12 @@ function renderPreview(d) {
     return head + `
       <table>
         <thead>
-          <tr><th rowspan="2" class="text-left">${esc(d.head.mapel)}</th>${d.head.kelas.map((k) => `<th colspan="2">${esc(k)}</th>`).join('')}</tr>
+          <tr><th rowspan="2" class="w-10">${esc(d.head.no || 'No.')}</th><th rowspan="2" class="text-left">${esc(d.head.mapel)}</th>${d.head.kelas.map((k) => `<th colspan="2">${esc(k)}</th>`).join('')}</tr>
           <tr>${[1, 2, 3, 4, 5, 6].map((n) => `<th>${n}</th>`).join('')}</tr>
         </thead>
-        <tbody>${d.rows.map((r) => r.grup ? `<tr class="grp"><td colspan="7">${esc(r.grup)}</td></tr>`
-          : `<tr><td>${esc(r.mapel)}</td>${r.n.map((v) => `<td class="num">${esc(v)}</td>`).join('')}</tr>`).join('')}
-          <tr class="foot"><td>${esc(d.head.avg)}</td>${d.avg.map((v) => `<td class="num">${esc(v)}</td>`).join('')}</tr>
+        <tbody>${d.rows.map((r) => r.grup ? `<tr class="grp"><td colspan="8">${esc(r.grup)}</td></tr>`
+          : `<tr><td class="num">${esc(r.no || '')}</td><td>${esc(r.mapel)}</td>${r.n.map((v) => `<td class="num">${esc(v)}</td>`).join('')}</tr>`).join('')}
+          <tr class="foot"><td colspan="2">${esc(d.head.avg)}</td>${d.avg.map((v) => `<td class="num">${esc(v)}</td>`).join('')}</tr>
         </tbody>
       </table>`;
   }
@@ -1503,7 +1763,7 @@ function xlCell(v) {
 
 function buildTranscriptSheet(d) {
   const rows = [], merges = [];
-  const width = d.kind === 'RAPOR' ? 7 : (d.showNo ? 7 : 6);
+  const width = d.kind === 'RAPOR' ? 8 : (d.showNo ? 7 : 6);
   const line = (arr) => (Array.isArray(arr) ? arr : [arr]).filter((x) => x !== '' && x != null).join(' / ');
   const push = (cells, mergeAll) => {
     const r = rows.length;
@@ -1523,11 +1783,14 @@ function buildTranscriptSheet(d) {
 
   if (d.kind === 'RAPOR') {
     let r = rows.length;
-    push([d.head.mapel, d.head.kelas[0], '', d.head.kelas[1], '', d.head.kelas[2], '']);
-    merges.push({ s: { r, c: 1 }, e: { r, c: 2 } }, { s: { r, c: 3 }, e: { r, c: 4 } }, { s: { r, c: 5 }, e: { r, c: 6 } });
-    push(['', 1, 2, 3, 4, 5, 6]);
-    d.rows.forEach((x) => (x.grup ? push([x.grup], true) : push([x.mapel].concat(x.n))));
-    push([d.head.avg].concat(d.avg));
+    push([d.head.no || 'No.', d.head.mapel, d.head.kelas[0], '', d.head.kelas[1], '', d.head.kelas[2], '']);
+    merges.push({ s: { r, c: 0 }, e: { r: r + 1, c: 0 } }, { s: { r, c: 1 }, e: { r: r + 1, c: 1 } },
+      { s: { r, c: 2 }, e: { r, c: 3 } }, { s: { r, c: 4 }, e: { r, c: 5 } }, { s: { r, c: 6 }, e: { r, c: 7 } });
+    push(['', '', 1, 2, 3, 4, 5, 6]);
+    d.rows.forEach((x) => (x.grup ? push([x.grup], true) : push([x.no === undefined ? '' : Number(x.no) || x.no, x.mapel].concat(x.n))));
+    r = rows.length;
+    push([d.head.avg, ''].concat(d.avg));
+    merges.push({ s: { r, c: 0 }, e: { r, c: 1 } });
   } else {
     const c = d.cols;
     d.semesters.forEach((sm) => {
@@ -1559,7 +1822,7 @@ function buildTranscriptSheet(d) {
   }));
   ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: Math.max(rows.length - 1, 0), c: Math.max(maxC, width - 1) } });
   ws['!merges'] = merges;
-  ws['!cols'] = d.kind === 'RAPOR' ? [{ wch: 46 }].concat(Array(6).fill({ wch: 9 }))
+  ws['!cols'] = d.kind === 'RAPOR' ? [{ wch: 5 }, { wch: 46 }].concat(Array(6).fill({ wch: 9 }))
     : (d.showNo ? [{ wch: 5 }] : []).concat([{ wch: 46 }, { wch: 9 }, { wch: 10 }, { wch: 9 }, { wch: 8 }, { wch: 10 }]);
   return ws;
 }
