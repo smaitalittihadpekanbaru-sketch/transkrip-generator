@@ -1009,6 +1009,7 @@ function bindEvents() {
   $('btnAddStudent').addEventListener('click', () => openStudentForm());
   $('btnSubjects').addEventListener('click', () => { renderSubjects(); openModal('modalSubjects'); });
   $('btnTemplates').addEventListener('click', () => { openModal('modalTemplates'); loadTemplates(); });
+  bindKurikulum();
   $('templateRows').addEventListener('click', onTemplateAction);
   $('templateRows').addEventListener('change', onTemplateFile);
 
@@ -1325,6 +1326,164 @@ async function saveSusunan(p) {
   } catch (e) { toast(errMsg(e), 'err', 10000); }
 }
 
+/* ---- Database Kurikulum (editor) ----------------------------------------- */
+const KUR_GROUPS = [['Kelompok Umum', 'U'], ['Kelompok Peminatan', 'P'], ['Kelompok Kekhasan SMAIT', 'K']];
+let kurSeq = 0;
+const kurGroupOf = (r) => (/peminatan|pilihan/i.test(r.Kelompok) ? 'P' : /kekhasan|muatan|lokal/i.test(r.Kelompok) ? 'K' : 'U');
+
+async function openKurikulum(nama) {
+  openModal('modalKurikulum');
+  $('kurBody').innerHTML = '<div class="text-center py-10 text-slate-500">Memuat database kurikulum…</div>';
+  try { setKur(await call('apiGetKurikulum', nama || '')); }
+  catch (e) { $('kurBody').innerHTML = `<div class="text-center py-10 text-red-600">${esc(errMsg(e))}</div>`; }
+}
+
+function setKur(d) {
+  state.kur = { nama: d.nama, aktif: d.aktif, daftar: d.daftar, bawaan: d.bawaan, subjects: d.subjects || [],
+    rows: d.rows.map((r) => Object.assign({ _id: ++kurSeq }, r)), tab: (state.kur && state.kur.tab) || 'X', dirty: !!d.bawaan };
+  const names = [...new Set(d.daftar.concat([d.nama]))];
+  $('kurPilih').innerHTML = names.map((n) => `<option ${n === d.nama ? 'selected' : ''}>${esc(n)}</option>`).join('');
+  $('kurAktif').textContent = d.nama === d.aktif ? '✓ aktif di transkrip' : 'tidak aktif — disimpan = dijadikan aktif';
+  $('kurAktif').className = 'chip ' + (d.nama === d.aktif ? 'chip-ok' : 'chip-warn');
+  renderKur();
+}
+
+function kurSection(kelas, g, pem) {
+  return state.kur.rows.filter((r) => r.Kelas === kelas && kurGroupOf(r) === g && (g !== 'P' || r.Peminatan === pem))
+    .sort((a, b) => (Number(a.Urutan) || 0) - (Number(b.Urutan) || 0));
+}
+
+function renderKur() {
+  const k = state.kur, kelas = k.tab;
+  document.querySelectorAll('#kurTabs .tab').forEach((b) => b.classList.toggle('active', b.dataset.kelas === kelas));
+  const subjOpts = (sel) => `<option value="">(dari nama)</option>` + k.subjects.map((s) => `<option value="${esc(s.kode)}" ${s.kode === sel ? 'selected' : ''}>${esc(s.kode)} — ${esc(s.nama)}</option>`).join('');
+  const jpSum = (rows) => rows.filter((r) => r.Tampil !== 'TIDAK').reduce((a, r) => a + (Number(String(r.JP).replace(',', '.')) || 0), 0);
+  const table = (rows, g, pem) => `
+    <table class="data mb-1">
+      <thead><tr><th class="w-10">No</th><th>Mata Pelajaran (struktur)</th><th>Nama di transkrip</th><th class="w-56">Kode</th><th class="w-16">JP</th><th class="w-14">Cetak</th><th class="w-24"></th></tr></thead>
+      <tbody>${rows.map((r, i) => `
+        <tr data-id="${r._id}" class="${r.Tampil === 'TIDAK' ? 'opacity-50' : ''}">
+          <td class="text-slate-400">${i + 1}</td>
+          <td><input class="input input-sm" data-f="Nama_Mapel" value="${esc(r.Nama_Mapel)}" placeholder="mis. Sejarah"></td>
+          <td><input class="input input-sm" data-f="Nama_Transkrip" value="${esc(r.Nama_Transkrip)}" placeholder="otomatis"></td>
+          <td><select class="input input-sm" data-f="Kode_Mapel">${subjOpts(r.Kode_Mapel)}</select></td>
+          <td><input class="input input-sm text-right" data-f="JP" value="${esc(r.JP)}" inputmode="decimal"></td>
+          <td class="text-center"><input type="checkbox" data-f="Tampil" ${r.Tampil !== 'TIDAK' ? 'checked' : ''}></td>
+          <td class="whitespace-nowrap"><button class="btn btn-ghost btn-sm" data-act="up" type="button" title="Naik">↑</button><button class="btn btn-ghost btn-sm" data-act="down" type="button" title="Turun">↓</button><button class="btn btn-ghost btn-sm text-red-600" data-act="del" type="button" title="Hapus">✕</button></td>
+        </tr>`).join('')}
+      </tbody>
+      <tfoot><tr><td colspan="4"><button class="btn btn-ghost btn-sm" data-add="${g}" data-pem="${esc(pem || '')}" type="button">+ Tambah mapel</button></td>
+        <td class="text-right font-bold">${jpSum(rows)}</td><td colspan="2" class="text-xs text-slate-500">Jumlah JP</td></tr></tfoot>
+    </table>`;
+  let html = '';
+  const umum = kurSection(kelas, 'U'), khas = kurSection(kelas, 'K');
+  html += `<h4 class="font-bold text-brand-800 mt-1 mb-1">Kelompok Umum</h4>` + table(umum, 'U');
+  const pems = [...new Set(k.rows.filter((r) => r.Kelas === kelas && kurGroupOf(r) === 'P').map((r) => r.Peminatan))];
+  html += `<div class="flex items-center gap-2 mt-4 mb-1"><h4 class="font-bold text-brand-800">Kelompok Peminatan</h4>
+    <button class="btn btn-ghost btn-sm" data-addpem="1" type="button">+ Peminatan / Paket</button></div>`;
+  if (!pems.length) html += `<div class="text-xs text-slate-500 mb-2">Tidak ada peminatan di kelas ini.</div>`;
+  pems.forEach((p) => {
+    html += `<div class="mt-2 mb-1 flex items-center gap-2"><span class="text-xs text-slate-500">Peminatan / paket:</span>
+      <input class="input input-sm w-64 font-semibold" data-pemname="${esc(p)}" value="${esc(p)}"></div>` + table(kurSection(kelas, 'P', p), 'P', p);
+  });
+  html += `<h4 class="font-bold text-brand-800 mt-4 mb-1">Kelompok Kekhasan SMAIT</h4>` + table(khas, 'K');
+  $('kurBody').innerHTML = html;
+  const base = jpSum(umum) + jpSum(khas);
+  $('kurTotal').innerHTML = `Jumlah JP Kelas ${kelas}: ` + (pems.length
+    ? pems.map((p) => `${esc(p)} <b>${base + jpSum(kurSection(kelas, 'P', p))}</b>`).join(' · ') : `<b>${base}</b>`);
+  $('kurDirty').textContent = k.dirty ? (k.bawaan ? 'Database bawaan (struktur kurikulum fix) — klik Simpan untuk memasangnya.' : 'Ada perubahan yang belum disimpan.') : '';
+}
+
+function kurRow(el) { const tr = el.closest('tr[data-id]'); return tr ? state.kur.rows.find((r) => r._id === Number(tr.dataset.id)) : null; }
+function kurMark() { state.kur.dirty = true; $('kurDirty').textContent = 'Ada perubahan yang belum disimpan.'; }
+
+function bindKurikulum() {
+  $('btnKurikulum').addEventListener('click', () => openKurikulum());
+  $('kurTabs').addEventListener('click', (e) => { const b = e.target.closest('[data-kelas]'); if (b) { state.kur.tab = b.dataset.kelas; renderKur(); } });
+  $('kurPilih').addEventListener('change', (e) => openKurikulum(e.target.value));
+  $('kurReload').addEventListener('click', () => openKurikulum(state.kur && state.kur.nama));
+  $('kurBody').addEventListener('input', (e) => {
+    const r = kurRow(e.target);
+    if (r && e.target.dataset.f && e.target.type !== 'checkbox') { r[e.target.dataset.f] = e.target.value; kurMark(); }
+  });
+  $('kurBody').addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.dataset.pemname !== undefined) {
+      const old = t.dataset.pemname, nw = t.value.trim();
+      if (!nw) { t.value = old; return; }
+      state.kur.rows.forEach((r) => { if (r.Kelas === state.kur.tab && kurGroupOf(r) === 'P' && r.Peminatan === old) r.Peminatan = nw; });
+      kurMark(); renderKur(); return;
+    }
+    const r = kurRow(t);
+    if (!r) return;
+    if (t.dataset.f === 'Tampil') { r.Tampil = t.checked ? 'YA' : 'TIDAK'; kurMark(); renderKur(); }
+    else if (t.dataset.f === 'Kode_Mapel') {
+      r.Kode_Mapel = t.value;
+      const s = state.kur.subjects.find((x) => x.kode === t.value);
+      if (s && !r.Nama_Mapel) r.Nama_Mapel = s.nama;
+      kurMark(); renderKur();
+    } else if (t.dataset.f === 'JP') renderKur();
+  });
+  $('kurBody').addEventListener('click', (e) => {
+    const k = state.kur, kelas = k.tab;
+    const add = e.target.closest('[data-add]');
+    if (add) {
+      const g = add.dataset.add, pem = add.dataset.pem;
+      const sec = kurSection(kelas, g, pem);
+      k.rows.push({ _id: ++kurSeq, Kelas: kelas, Peminatan: g === 'P' ? pem : '', Kelompok: KUR_GROUPS.find((x) => x[1] === g)[0],
+        Urutan: (sec.length ? Number(sec[sec.length - 1].Urutan) || 0 : 0) + 1, Nama_Mapel: '', Nama_Transkrip: '', Kode_Mapel: '', JP: '', Tampil: 'YA' });
+      kurMark(); renderKur(); return;
+    }
+    if (e.target.closest('[data-addpem]')) {
+      let n = 1, name = 'Peminatan Baru';
+      while (k.rows.some((r) => r.Kelas === kelas && r.Peminatan === name)) name = 'Peminatan Baru ' + (++n);
+      k.rows.push({ _id: ++kurSeq, Kelas: kelas, Peminatan: name, Kelompok: 'Kelompok Peminatan', Urutan: 1, Nama_Mapel: '', Nama_Transkrip: '', Kode_Mapel: '', JP: '', Tampil: 'YA' });
+      kurMark(); renderKur(); return;
+    }
+    const btn = e.target.closest('[data-act]');
+    const r = btn && kurRow(btn);
+    if (!r) return;
+    const sec = kurSection(r.Kelas, kurGroupOf(r), r.Peminatan);
+    const i = sec.indexOf(r);
+    if (btn.dataset.act === 'del') k.rows = k.rows.filter((x) => x !== r);
+    else {
+      const j = btn.dataset.act === 'up' ? i - 1 : i + 1;
+      if (j < 0 || j >= sec.length) return;
+      sec.forEach((x, n) => { x.Urutan = n + 1; });
+      [sec[i].Urutan, sec[j].Urutan] = [sec[j].Urutan, sec[i].Urutan];
+    }
+    kurMark(); renderKur();
+  });
+  $('kurSave').addEventListener('click', saveKurikulumDb);
+}
+
+async function saveKurikulumDb() {
+  const k = state.kur;
+  // urutan bersambung per kelompok agar nomor rapi
+  ['X', 'XI', 'XII'].forEach((kelas) => {
+    let base = 0;
+    kurSection(kelas, 'U').forEach((r) => { r.Urutan = ++base; });
+    let maxP = base;
+    [...new Set(k.rows.filter((r) => r.Kelas === kelas && kurGroupOf(r) === 'P').map((r) => r.Peminatan))].forEach((p) => {
+      let n = base;
+      kurSection(kelas, 'P', p).forEach((r) => { r.Urutan = ++n; });
+      maxP = Math.max(maxP, n);
+    });
+    kurSection(kelas, 'K').forEach((r) => { r.Urutan = ++maxP; });
+  });
+  const rows = k.rows.filter((r) => String(r.Nama_Mapel).trim() || r.Kode_Mapel)
+    .map(({ _id, ...r }) => r);
+  try {
+    const res = await withLoading('Menyimpan database kurikulum…', () => call('apiSaveKurikulum', { nama: k.nama, rows, aktif: true }));
+    setKur(res);
+    state.kur.dirty = false; renderKur();
+    state.jurusan = res.jurusan; state.kurikulum = res.kurikulum;
+    renderJurusanSelect(); if (state.lastStatus) renderStatus(state.lastStatus);
+    toast(`Kurikulum ${res.nama} disimpan dan aktif. Transkrip berikutnya memakai urutan, nama, dan JP ini.` +
+      (res.newSubjects && res.newSubjects.length ? `\nMapel baru: ${res.newSubjects.join(', ')} — lengkapi nama EN/AR di menu Mata Pelajaran.` : ''), 'ok', 9000);
+  } catch (e) { toast(errMsg(e), 'err', 15000); }
+}
+
 /* ---- Modal Template ------------------------------------------------------ */
 async function loadTemplates() {
   $('templateRows').innerHTML = `<tr><td colspan="4" class="text-center py-6 text-slate-500">Memuat…</td></tr>`;
@@ -1413,7 +1572,7 @@ async function saveKurikulum(p) {
     state.jurusan = res.jurusan; state.kurikulum = res.kurikulum; state.subjects = res.subjects;
     renderJurusanSelect(); if (state.lastStatus) renderStatus(state.lastStatus); setStudents(res.students);
     clearParsed();
-    toast(`Kurikulum ${res.nama} tersimpan (${res.mapel} baris, ${res.jurusan.length} jurusan aktif).` +
+    toast(`Kurikulum ${res.nama} tersimpan ke database dan dijadikan aktif (${res.mapel} baris, ${res.jurusan.length} jurusan). Urutan, nama, dan JP transkrip kini mengikuti struktur ini — cek/ubah di menu Kurikulum.` +
       (res.tersembunyi.length ? `\nTidak dicetak di transkrip: ${res.tersembunyi.join(', ')}.` : '') +
       (res.newSubjects.length ? `\nMapel baru: ${res.newSubjects.join(', ')} — lengkapi nama EN/AR di menu Mata Pelajaran.` : ''), 'ok', 9000);
   } catch (e) { toast(errMsg(e), 'err', 9000); }
