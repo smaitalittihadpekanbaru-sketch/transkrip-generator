@@ -197,6 +197,7 @@
           <button id="tabHistory" class="tab" type="button" role="tab">Riwayat Transkrip <span id="histCount" class="chip chip-ok ml-1">0</span></button>
         </nav>
         <div class="ml-auto flex flex-wrap gap-2 pb-2">
+          <button id="btnKurikulum" class="btn btn-ghost btn-sm" type="button">Kurikulum</button>
           <button id="btnTemplates" class="btn btn-ghost btn-sm" type="button">Template</button>
           <button id="btnSubjects" class="btn btn-ghost btn-sm" type="button">Mata Pelajaran</button>
           <button id="btnAddStudent" class="btn btn-ghost btn-sm" type="button">+ Siswa</button>
@@ -322,6 +323,34 @@
           <thead><tr><th class="w-24">Kode</th><th>Nama (ID)</th><th>Name (EN)</th><th class="w-28">EN (GPA)</th><th class="text-right">الاسم (AR)</th><th class="w-32">Kelompok</th><th>Alias</th><th class="w-24">Setara</th><th class="w-20">Cetak</th><th class="w-14">Urut</th><th class="w-28"></th></tr></thead>
           <tbody id="subjectRows"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ MODAL: DATABASE KURIKULUM ============================ -->
+  <div id="modalKurikulum" class="hidden fixed inset-0 z-40 modal-bg flex items-start justify-center p-3 sm:p-6">
+    <div class="bg-white rounded-2xl w-full max-w-[1100px] shadow-2xl max-h-[94vh] flex flex-col">
+      <div class="px-5 py-3 border-b flex flex-wrap items-center gap-3">
+        <h3 class="font-bold text-brand-800">Database Kurikulum</h3>
+        <select id="kurPilih" class="input input-sm" style="width:auto;max-width:220px"></select>
+        <span id="kurAktif" class="chip chip-ok"></span>
+        <span class="text-xs text-slate-500">Urutan, kelompok, nama, dan JP di sini dipakai semua format transkrip (3 Bahasa, GPA, Rapor). JP = SKS.</span>
+        <button class="ml-auto btn btn-ghost btn-sm" data-close="modalKurikulum" type="button">Tutup</button>
+      </div>
+      <div class="px-5 pt-3 flex flex-wrap items-center gap-2 border-b">
+        <nav id="kurTabs" class="flex gap-1" role="tablist">
+          <button class="tab active" data-kelas="X" type="button">Kelas X</button>
+          <button class="tab" data-kelas="XI" type="button">Kelas XI</button>
+          <button class="tab" data-kelas="XII" type="button">Kelas XII</button>
+        </nav>
+        <span id="kurTotal" class="ml-auto pb-2 text-sm text-slate-600"></span>
+      </div>
+      <div id="kurBody" class="p-4 scroll-y text-sm"></div>
+      <div class="px-5 py-3 border-t flex flex-wrap items-center gap-2">
+        <span id="kurDirty" class="text-xs text-amber-700"></span>
+        <span class="text-[11px] text-slate-500">Nomor diurutkan ulang otomatis saat disimpan (Umum → Peminatan → Kekhasan). Kode kosong = dicocokkan dari nama mapel.</span>
+        <button id="kurReload" class="ml-auto btn btn-ghost btn-sm" type="button">Batalkan perubahan</button>
+        <button id="kurSave" class="btn btn-primary btn-sm" type="button">Simpan Kurikulum</button>
       </div>
     </div>
   </div>
